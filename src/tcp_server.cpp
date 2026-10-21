@@ -1,6 +1,6 @@
 #include "netforge/frame_parser.hpp"
 #include "netforge/socket_handle.hpp"
-
+#include <unistd.h>
 #include <algorithm>
 #include <cerrno>
 #include <cstddef>
@@ -18,8 +18,39 @@
 #include <string_view>
 #include <system_error>
 #include <optional>
+#include <csignal>
 
 namespace {
+
+volatile std::sig_atomic_t shutdown_requested = 0;
+volatile std::sig_atomic_t shutdown_pipe_write_fd = -1;
+
+void handle_shutdown_signal(int)
+{
+    const int saved_errno = errno;
+
+    shutdown_requested = 1;
+
+    const int fd =
+        static_cast<int>(shutdown_pipe_write_fd);
+
+    if (fd >= 0) {
+        const unsigned char signal_byte = 1;
+
+        // write() is async-signal-safe.
+        // The pipe is non-blocking, so this won't wait for space.
+        (void)::write(fd, &signal_byte, sizeof(signal_byte));
+    }
+
+    errno = saved_errno;
+}
+
+struct SignalPipeWriteFdReset {
+    ~SignalPipeWriteFdReset()
+    {
+        shutdown_pipe_write_fd = -1;
+    }
+};
 
 constexpr std::uint16_t PORT = 54000;
 
@@ -210,6 +241,36 @@ int main(int argc, char* argv[])
 
     using netforge::SocketHandle;
 
+    // Create a pipe that will wake poll() when shutdown is requested.
+    int shutdown_pipe_fds[2];
+
+    if (::pipe(shutdown_pipe_fds) == -1) {
+        ::perror("pipe");
+        return 1;
+    }
+
+    // Both descriptors are owned by RAII wrappers.
+    SocketHandle shutdown_pipe_read(shutdown_pipe_fds[0]);
+    SocketHandle shutdown_pipe_write(shutdown_pipe_fds[1]);
+
+    // Both pipe ends must be non-blocking.
+    if (!set_nonblocking(shutdown_pipe_read.get()) ||
+        !set_nonblocking(shutdown_pipe_write.get())) {
+        return 1;
+    }
+
+    shutdown_pipe_write_fd = shutdown_pipe_write.get();
+
+    SignalPipeWriteFdReset reset_signal_pipe_write_fd;
+
+    // Register handlers only after the pipe is ready.
+    if (std::signal(SIGINT, handle_shutdown_signal) == SIG_ERR ||
+        std::signal(SIGTERM, handle_shutdown_signal) == SIG_ERR) {
+        std::cerr
+            << "Failed to register shutdown signal handlers\n";
+        return 1;
+    }
+
     SocketHandle server_fd(
         ::socket(AF_INET, SOCK_STREAM, 0));
 
@@ -258,12 +319,15 @@ int main(int argc, char* argv[])
 
     std::vector<ClientConnection> clients;
 
-    while (true) {
+    while (!shutdown_requested) {
         std::vector<pollfd> poll_fds;
         std::vector<std::size_t> poll_to_client;
 
-        poll_fds.push_back(
-            pollfd{server_fd.get(), POLLIN, 0});
+        poll_fds.push_back(pollfd{server_fd.get(), POLLIN, 0});
+
+        // poll_fds[0]: listening socket
+        // poll_fds[1]: shutdown pipe
+        poll_fds.push_back(pollfd{shutdown_pipe_read.get(), POLLIN, 0});
 
         // Build a poll entry for every currently connected client.
         for (std::size_t i = 0; i < clients.size(); ++i) {
@@ -335,6 +399,49 @@ int main(int argc, char* argv[])
             return 1;
         }
 
+        // ---------- HANDLE SHUTDOWN PIPE ----------
+        if (poll_fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            std::cerr << "Shutdown pipe error\n";
+            return 1;
+        }
+
+        if (poll_fds[1].revents & POLLIN) {
+            unsigned char buffer[64];
+
+            // Drain all available bytes. The pipe is non-blocking.
+            while (true) {
+                const ssize_t bytes_read = ::read(
+                    shutdown_pipe_read.get(),
+                    buffer,
+                    sizeof(buffer));
+
+                if (bytes_read > 0) {
+                    continue;
+                }
+
+                if (bytes_read == -1 && errno == EINTR) {
+                    continue;
+                }
+
+                if (bytes_read == -1 &&
+                    (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    break;
+                }
+
+                if (bytes_read == 0) {
+                    break;
+                }
+
+                ::perror("read shutdown pipe");
+                return 1;
+            }
+        }
+
+        // Exit before processing any more client or listener events.
+        if (shutdown_requested) {
+            break;
+        }
+
         const auto timeout_check_time = std::chrono::steady_clock::now();
 
         for (auto& client : clients) {
@@ -370,13 +477,12 @@ int main(int argc, char* argv[])
 
         // Process events for the clients that were present when
         // this poll() call was prepared.
-        for (std::size_t p = 1; p < poll_fds.size(); ++p) {
+        for (std::size_t p = 2; p < poll_fds.size(); ++p) {
             if (poll_fds[p].revents == 0) {
                 continue;
             }
 
-            const std::size_t client_index =
-                poll_to_client[p - 1];
+            const std::size_t client_index = poll_to_client[p - 2];
 
             ClientConnection& client = clients[client_index];
 
@@ -603,6 +709,8 @@ int main(int argc, char* argv[])
                 }),
             clients.end());
     }
+
+    std::cout << "Shutdown requested; closing server and client sockets\n";
 
     return 0;
 }

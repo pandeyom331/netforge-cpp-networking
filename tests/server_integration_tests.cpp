@@ -142,6 +142,55 @@ public:
         pid_ = -1;
     }
 
+    bool request_graceful_shutdown(
+        std::chrono::milliseconds timeout)
+    {
+        if (pid_ <= 0) {
+            return false;
+        }
+
+        if (::kill(pid_, SIGTERM) == -1 && errno != ESRCH) {
+            throw std::runtime_error(
+                "kill(SIGTERM) failed during shutdown test");
+        }
+
+        const auto deadline =
+            std::chrono::steady_clock::now() + timeout;
+
+        int status = 0;
+
+        while (std::chrono::steady_clock::now() < deadline) {
+            const pid_t result =
+                ::waitpid(pid_, &status, WNOHANG);
+
+            if (result == pid_) {
+                pid_ = -1;
+
+                return WIFEXITED(status) &&
+                    WEXITSTATUS(status) == 0;
+            }
+
+            if (result == -1 && errno != EINTR) {
+                throw std::runtime_error(
+                    "waitpid() failed during shutdown test");
+            }
+
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(10));
+        }
+
+        // The server did not exit in time. Terminate and reap it
+        // so a failed test cannot leave a child process behind.
+        ::kill(pid_, SIGKILL);
+
+        while (::waitpid(pid_, &status, 0) == -1 &&
+            errno == EINTR) {
+        }
+
+        pid_ = -1;
+        return false;
+    }
+
 private:
     pid_t pid_{-1};
 };
@@ -582,6 +631,19 @@ void test_idle_client_times_out()
     std::cout << "[PASS] Idle client is disconnected after timeout\n";
 }
 
+void test_graceful_shutdown_while_poll_is_idle(
+    ServerProcess& server)
+{
+    require(
+        server.request_graceful_shutdown(
+            std::chrono::milliseconds(1500)),
+        "Server did not exit cleanly after SIGTERM "
+        "within 1500 ms");
+
+    std::cout
+        << "[PASS] Server gracefully shuts down while poll is idle\n";
+}
+
 void test_incomplete_frame_times_out_despite_trickled_bytes()
 {
     auto client = connect_to_server();
@@ -697,6 +759,13 @@ int main(int argc, char* argv[])
             ServerProcess frame_timeout_server(argv[1],"4000","1500");
             test_incomplete_frame_times_out_despite_trickled_bytes();
             frame_timeout_server.stop();
+        }
+
+        {
+            ServerProcess shutdown_server(argv[1]);
+
+            test_graceful_shutdown_while_poll_is_idle(
+                shutdown_server);
         }
 
         std::cout << "\nAll integration tests passed.\n";
